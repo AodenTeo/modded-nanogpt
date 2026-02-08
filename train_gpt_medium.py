@@ -1481,9 +1481,9 @@ class TrainingManager():
         muon_params = [p for p in model.parameters() if getattr(p, 'label', None) in muon_labels]
         assert set(getattr(p, 'label', None) for p in model.parameters()) == set(adam_labels + scalar_labels + muon_labels), "All params must have label"
 
-        self.adam_opt = DistAdam(adam_params, adam_labels, lr=0.004, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
+        self.adam_opt = DistAdam(adam_params, adam_labels, lr=args.adam_lr, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.005)
         self.scalar_opt = DistAdam(scalar_params, scalar_labels, lr=0.008, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.005)
-        self.muon_opt = NorMuon(muon_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        self.muon_opt = NorMuon(muon_params, lr=args.muon_lr, momentum=0.95, beta2=0.95, weight_decay=1.2)
         self.optimizers = [self.adam_opt, self.scalar_opt, self.muon_opt]
         # split after odd number step
         self.split_step = math.ceil(args.split_embed_frac * args.num_scheduled_iterations) | 1
@@ -1627,8 +1627,11 @@ class Hyperparameters:
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.70  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3/4
+    # learning rates (overridable via MUON_LR / ADAM_LR env vars)
+    muon_lr: float = float(os.environ.get("MUON_LR", "0.015"))
+    adam_lr: float = float(os.environ.get("ADAM_LR", "0.004"))
     # evaluation and logging
-    run_id: str = f"{uuid.uuid4()}"
+    run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
