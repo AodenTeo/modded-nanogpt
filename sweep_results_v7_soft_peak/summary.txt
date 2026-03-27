@@ -1,0 +1,9 @@
+========================================
+Warmup Sweep started: Wed Mar 25 20:02:03 UTC 2026
+Muon LRs: 0.010 0.012
+Adam LR: 0.004
+Cooldown: 0.70
+Decay floor: 0.1
+Ramp stretch: 1.5 2.0 2.5
+Peak mults: 1.73 1.9 2.0
+========================================

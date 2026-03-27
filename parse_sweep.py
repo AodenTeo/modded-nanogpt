@@ -17,13 +17,29 @@ def parse_log(filepath: Path):
 
 
 def extract_config(filename: str):
-    """Extract muon_lr and adam_lr from log filename."""
-    match = re.match(
-        r"sweep_muon([\d.]+)_adam([\d.]+)\.log", filename
-    )
-    if not match:
-        return None, None
-    return float(match.group(1)), float(match.group(2))
+    """Extract config values from log filename."""
+    config = {}
+    # Match muon LR
+    m = re.search(r"muon([\d.]+?)(?:_|\.log|$)", filename)
+    if m:
+        config["muon_lr"] = float(m.group(1))
+    # Match adam LR
+    m = re.search(r"adam([\d.]+?)(?:_|\.log|$)", filename)
+    if m:
+        config["adam_lr"] = float(m.group(1))
+    # Match cooldown frac
+    m = re.search(r"cd([\d.]+?)(?:_|\.log|$)", filename)
+    if m:
+        config["cd_frac"] = float(m.group(1))
+    # Match delayed ramp factor
+    m = re.search(r"stretch([\d.]+?)(?:_|\.log|$)", filename)
+    if m:
+        config["stretch"] = float(m.group(1))
+    # Match peak multiplier
+    m = re.search(r"peak([\d.]+?)(?:_|\.log|$)", filename)
+    if m:
+        config["peak"] = float(m.group(1))
+    return config
 
 
 def main():
@@ -32,36 +48,47 @@ def main():
     results = []
 
     for f in sorted(results_dir.glob("sweep_*.log")):
-        muon_lr, adam_lr = extract_config(f.name)
+        config = extract_config(f.name)
         val_loss, train_time_ms = parse_log(f)
-        if muon_lr is not None and val_loss is not None:
-            results.append((val_loss, train_time_ms, muon_lr, adam_lr))
+        if val_loss is not None:
+            results.append((val_loss, train_time_ms, config, f.name))
 
     if not results:
-        print("No results found. Check sweep_results/ for log files.")
+        print("No completed results found.")
         return
 
     # Sort by val_loss (best first)
     results.sort()
 
-    header = f"{'RANK':>4} {'MUON_LR':>9} {'ADAM_LR':>9} {'VAL_LOSS':>10} {'TIME(s)':>9} {'PASS':>5}"
+    # Build header from available config keys
+    all_keys = set()
+    for _, _, config, _ in results:
+        all_keys.update(config.keys())
+    col_order = [k for k in ["muon_lr", "adam_lr", "cd_frac", "stretch", "peak"] if k in all_keys]
+
+    header_parts = [f"{'RANK':>4}"]
+    for k in col_order:
+        header_parts.append(f"{k.upper():>10}")
+    header_parts += [f"{'VAL_LOSS':>10}", f"{'TIME(s)':>9}", f"{'PASS':>5}"]
+    header = " ".join(header_parts)
     sep = "-" * len(header)
 
     print(f"\n{sep}")
     print(header)
     print(sep)
-    for i, (val_loss, time_ms, muon_lr, adam_lr) in enumerate(results, 1):
+    for i, (val_loss, time_ms, config, _) in enumerate(results, 1):
         time_s = time_ms / 1000
         passed = "YES" if val_loss < 2.92 else "NO"
-        print(
-            f"{i:>4} {muon_lr:>9.3f} {adam_lr:>9.3f} "
-            f"{val_loss:>10.4f} {time_s:>9.1f} {passed:>5}"
-        )
+        parts = [f"{i:>4}"]
+        for k in col_order:
+            parts.append(f"{config.get(k, 0):>10.3f}")
+        parts += [f"{val_loss:>10.4f}", f"{time_s:>9.1f}", f"{passed:>5}"]
+        print(" ".join(parts))
     print(sep)
 
     best = results[0]
-    print(f"\nBest: muon_lr={best[2]}, adam_lr={best[3]} "
-          f"-> val_loss={best[0]:.4f}, time={best[1]/1000:.1f}s")
+    desc = ", ".join(f"{k}={best[2][k]}" for k in col_order)
+    print(f"\nBest: {desc} -> val_loss={best[0]:.4f}, time={best[1]/1000:.1f}s")
 
 
 if __name__ == "__main__":

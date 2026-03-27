@@ -33,6 +33,64 @@ from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
 
+class FP8Stats:
+    def __init__(self, enabled: bool, every: int, max_steps: int):
+        self.enabled = enabled
+        self.every = max(1, every)
+        self.max_steps = max_steps
+        self.keys = ("x", "w", "grad")
+        self.step = -1
+        self.reset_step()
+        self.run_max = {k: 0.0 for k in self.keys}
+
+    def reset_step(self):
+        self.step_max = {k: 0.0 for k in self.keys}
+
+    def is_active(self, step: int):
+        return self.enabled and 0 <= step < self.max_steps
+
+    def start_step(self, step: int):
+        self.step = step
+        self.reset_step()
+
+    def update(self, key: str, tensor: Tensor | None):
+        if tensor is None or not self.is_active(self.step):
+            return
+        value = float(tensor.detach().abs().max())
+        self.step_max[key] = max(self.step_max[key], value)
+        self.run_max[key] = max(self.run_max[key], value)
+
+    def reduce_max(self, values: dict[str, float]):
+        buf = torch.tensor([values[k] for k in self.keys], device=device)
+        dist.all_reduce(buf, op=dist.ReduceOp.MAX)
+        return dict(zip(self.keys, buf.tolist()))
+
+    def should_log(self):
+        return self.is_active(self.step) and (self.step + 1) % self.every == 0
+
+    def format(self, step: int, scales: dict[str, float], values: dict[str, float]):
+        scaled = {k: values[k] / scales[k] for k in self.keys}
+        tuned = {k: values[k] / 448 for k in self.keys}
+        return (
+            f"fp8_stats step:{step+1} "
+            f"x_max:{values['x']:.4f} x_fp8:{scaled['x']:.1f} x_s_next:{tuned['x']:.6f} "
+            f"w_max:{values['w']:.4f} w_fp8:{scaled['w']:.1f} w_s_next:{tuned['w']:.6f} "
+            f"grad_max:{values['grad']:.4f} grad_fp8:{scaled['grad']:.1f} grad_s_next:{tuned['grad']:.6f}"
+        )
+
+def fp8_stats_forward_hook(module: nn.Module, inputs, _output):
+    # Record the lm_head activation and weight ranges before any FP8 cast.
+    fp8_stats.update("x", inputs[0])
+    fp8_stats.update("w", module.weight)
+
+def fp8_stats_backward_hook(_module: nn.Module, _grad_input, grad_output):
+    # Record the gradient flowing into lm_head so grad_s can be tuned too.
+    fp8_stats.update("grad", grad_output[0] if grad_output else None)
+
+def attach_fp8_stats(module: nn.Module):
+    module.register_forward_hook(fp8_stats_forward_hook)
+    module.register_full_backward_hook(fp8_stats_backward_hook)
+
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -842,7 +900,7 @@ def norm(x: Tensor):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = False # turn off fp8 for now -> requires tuning of scales which hasnt been done on medium track
+        self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -1064,7 +1122,7 @@ class GPT(nn.Module):
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
 
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=0.75/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=32/448, w_s=2.25/448, grad_s=1.5/448)
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
@@ -1419,18 +1477,21 @@ def get_ws(step: int):
 # learning rate schedule: tied to batch size schedule, with cooldown at the end.
 def get_lr(step: int):
     if step > args.num_scheduled_iterations:
-        return 0.1
-    lr_max = 1.0
+        return args.decay_floor
     x = step / args.num_scheduled_iterations
-    if x > 1/12:
+    t1 = min((1/12) * args.lr_ramp_stretch, 0.999)
+    t2 = min((2/12) * args.lr_ramp_stretch, 0.999)
+    t3 = min((3/12) * args.lr_ramp_stretch, 0.999)
+    lr_max = 1.0
+    if x > t1:
        lr_max = 1.52  # (16/8)**0.6
-    if x > 2/12:
+    if x > t2:
         lr_max = 1.73  # (24/8)**0.5
-    if x > 3/12:
-        lr_max = 2.0
+    if x > t3:
+        lr_max = args.lr_peak_mult
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        lr = lr_max * w + (1 - w) * 0.1
+        lr = lr_max * w + (1 - w) * args.decay_floor
         return lr
     return lr_max
 
@@ -1542,8 +1603,8 @@ class TrainingManager():
 
     def advance_schedule(self, step: int):
         self.ws_short, new_ws_long = get_ws(step)
-        # only apply yarn for first few
-        if new_ws_long != self.ws_long and new_ws_long<=13:
+        # apply yarn on every window size transition
+        if new_ws_long != self.ws_long:
             self.model.yarn.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
@@ -1622,10 +1683,13 @@ class Hyperparameters:
     train_max_seq_len: int = 128 * 16 * 2 # doubled to enable longer window sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 4700  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "4700"))  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
-    cooldown_frac: float = 0.70  # fraction of num_scheduled_iterations spent cooling down the learning rate
+    cooldown_frac: float = float(os.environ.get("COOLDOWN_FRAC", "0.70"))
+    decay_floor: float = float(os.environ.get("DECAY_FLOOR", "0.1"))
+    lr_ramp_stretch: float = float(os.environ.get("LR_RAMP_STRETCH", "1.0"))
+    lr_peak_mult: float = float(os.environ.get("LR_PEAK_MULT", "2.0"))
     split_embed_frac: float = 2/3/4
     # learning rates (overridable via MUON_LR / ADAM_LR env vars)
     muon_lr: float = float(os.environ.get("MUON_LR", "0.015"))
@@ -1634,6 +1698,9 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", f"{uuid.uuid4()}")
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
+    fp8_stats: bool = bool(int(os.environ.get("FP8_STATS", "0")))
+    fp8_stats_every: int = int(os.environ.get("FP8_STATS_EVERY", "10"))
+    fp8_stats_steps: int = int(os.environ.get("FP8_STATS_STEPS", "200"))
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11, 13,
@@ -1674,6 +1741,8 @@ def print0(s, console=False):
                 print(s)
             print(s, file=f)
 
+fp8_stats = FP8Stats(args.fp8_stats, args.fp8_stats_every, args.fp8_stats_steps)
+
 # begin by printing this file (the Python code)
 print0(code)
 print0("="*100)
@@ -1696,13 +1765,19 @@ model: nn.Module = GPT(
     model_dim=1024,
     max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
 ).cuda()
+if args.fp8_stats:
+    attach_fp8_stats(model.lm_head)
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.weight.data = m.weight.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if args.fp8_stats:
+    # Hooks are more reliable in eager mode than under fullgraph compile.
+    print0("FP8 stats enabled; skipping torch.compile so hooks can log tensor ranges.", console=True)
+else:
+    model = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
@@ -1783,13 +1858,14 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
     # --------------- TRAINING SECTION -----------------
+    fp8_stats.start_step(step)
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizers on the last iteration before we step them
         if idx == grad_accum_steps - 1:
@@ -1798,11 +1874,19 @@ for step in range(train_steps + 1):
         inputs, targets, cum_seqlens = train_loader.send(send_args)
         (model(inputs, targets, cum_seqlens, training_manager.get_forward_args()) / grad_accum_steps).backward()
     training_manager.step_optimizers(step)
+    if fp8_stats.should_log():
+        scales = dict(x=model.lm_head.x_s, w=model.lm_head.w_s, grad=model.lm_head.grad_s)
+        reduced = fp8_stats.reduce_max(fp8_stats.step_max)
+        print0(fp8_stats.format(step, scales, reduced))
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
+if fp8_stats.enabled:
+    scales = dict(x=model.lm_head.x_s, w=model.lm_head.w_s, grad=model.lm_head.grad_s)
+    reduced = fp8_stats.reduce_max(fp8_stats.run_max)
+    print0("fp8_stats summary " + fp8_stats.format(train_steps - 1, scales, reduced))
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
